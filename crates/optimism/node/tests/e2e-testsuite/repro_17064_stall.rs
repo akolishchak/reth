@@ -1,11 +1,11 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::{Duration, Instant}};
 
 use alloy_eips::eip2718::Encodable2718;
 use alloy_genesis::Genesis;
 use alloy_primitives::{hex, Address, Bytes, B256, TxKind, U256};
 use alloy_rpc_types_engine::PayloadAttributes;
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
-use alloy_signer::Signer;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use reth_tracing::tracing;
 use reth_e2e_test_utils::{
@@ -15,6 +15,7 @@ use reth_node_core::args::TxPoolArgs;
 use reth_optimism_chainspec::OpChainSpecBuilder;
 use reth_optimism_node::{OpNode, OpPayloadBuilderAttributes};
 use reth_payload_builder::EthPayloadBuilderAttributes;
+use reth_rpc_api::EthApiServer;
 
 fn op_payload_attributes<T>(timestamp: u64, gas_limit: u64) -> OpPayloadBuilderAttributes<T> {
     // Copy of reth_optimism_node::utils::optimism_payload_attributes but with param gas_limit.
@@ -38,16 +39,23 @@ fn op_payload_attributes<T>(timestamp: u64, gas_limit: u64) -> OpPayloadBuilderA
 }
 
 // Minimal "transfer-like" tx builder mirroring reth_e2e_test_utils::transaction::tx()
-fn tx_request(chain_id: u64, nonce: u64, max_fee_per_gas: u128, tip: u128) -> TransactionRequest {
+fn tx_request(
+    chain_id: u64,
+    nonce: u64,
+    max_fee_per_gas: u128,
+    tip: u128,
+    gas: u64,
+    data: Bytes,
+) -> TransactionRequest {
     TransactionRequest {
         nonce: Some(nonce),
         value: Some(U256::from(1)),
         to: Some(TxKind::Call(Address::random())),
-        gas: Some(21_000),
+        gas: Some(gas),
         max_fee_per_gas: Some(max_fee_per_gas),
         max_priority_fee_per_gas: Some(tip),
         chain_id: Some(chain_id),
-        input: TransactionInput { input: None, data: None },
+        input: TransactionInput { input: None, data: Some(data) },
         ..Default::default()
     }
 }
@@ -95,7 +103,7 @@ fn funding_tx_request(
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "stress repro for #17064; run manually"]
 async fn repro_17064_op_stall_stress() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -111,28 +119,33 @@ async fn repro_17064_op_stall_stress() -> eyre::Result<()> {
     );
 
     let gas_limit = 200_000_000u64;
+    let spam_data_bytes: usize = 32 * 1024;
+    let spam_gas: u64 = 1_000_000;
 
     let (mut nodes, _tasks, mut wallet) = E2ETestSetupBuilder::<OpNode, _>::new(
         1,
         chain_spec,
         move |ts| op_payload_attributes(ts, gas_limit),
     )
-    .with_node_config_modifier(|config| {
+    .with_node_config_modifier(move |config| {
         let mut txpool = TxPoolArgs::default();
-        txpool.pending_max_count = 200_000;
-        txpool.pending_max_size = 1024;
-        txpool.basefee_max_count = 200_000;
-        txpool.basefee_max_size = 1024;
-        txpool.queued_max_count = 200_000;
-        txpool.queued_max_size = 1024;
-        txpool.max_account_slots = 4096;
-        txpool.additional_validation_tasks = 8;
+        txpool.pending_max_count = 1_000_000;
+        txpool.pending_max_size = 4096;
+        txpool.basefee_max_count = 1_000_000;
+        txpool.basefee_max_size = 4096;
+        txpool.queued_max_count = 1_000_000;
+        txpool.queued_max_size = 4096;
+        txpool.max_account_slots = 16_384;
+        txpool.max_tx_input_bytes = spam_data_bytes * 2;
+        txpool.max_tx_gas_limit = Some(spam_gas);
+        //txpool.additional_validation_tasks = 8;
         config.set_dev(false).with_txpool(txpool)
     })
     .build()
     .await?;
 
     let node = &mut nodes[0];
+    let rpc = node.rpc.inner.clone();
 
     // Generate many funded test accounts from the standard test mnemonic.
     // Wallet::wallet_gen() is designed for this.
@@ -154,7 +167,10 @@ async fn repro_17064_op_stall_stress() -> eyre::Result<()> {
     let target_senders: usize = 256;
     let blocks: u64 = 50_000;
     let txs_per_block: usize = 10_000;
-    let warmup_txs: usize = 200_000;
+    let warmup_txs: usize = 1_000_000;
+    let warmup_duration = Duration::from_secs(120);
+    let warmup_concurrency: usize = 256;
+    let per_block_concurrency: usize = 512;
     let fund_batch: usize = 50;
     let fund_value: U256 = U256::from(1_000_000_000_000_000_000u128);
 
@@ -179,6 +195,7 @@ async fn repro_17064_op_stall_stress() -> eyre::Result<()> {
     let l1_info_tip: u128 = 2_000_000_000;
     let funding_max_fee: u128 = 400_000_000_000;
     let funding_tip: u128 = 5_000_000_000;
+    let spam_data = Bytes::from(vec![0u8; spam_data_bytes]);
 
     let per_rpc_timeout = Duration::from_secs(2);
     let per_block_timeout = Duration::from_secs(15);
@@ -228,22 +245,68 @@ async fn repro_17064_op_stall_stress() -> eyre::Result<()> {
         }
     }
 
-    if warmup_txs > 0 {
-        for i in 0..warmup_txs {
-            let idx = i % senders.len();
-            let signer = senders[idx].clone();
+    if warmup_txs > 0 && warmup_duration > Duration::from_secs(0) {
+        let mut inflight = FuturesUnordered::new();
+        let mut sent = 0usize;
+        let mut pool_full = false;
+        let warmup_deadline = Instant::now() + warmup_duration;
 
-            let nonce = nonces[idx];
-            let tx = tx_request(chain_id, nonce, spam_max_fee, spam_tip);
-            let signed = TransactionTestContext::sign_tx(signer, tx).await;
-            let raw: Bytes = signed.encoded_2718().into();
+        while sent < warmup_txs && Instant::now() < warmup_deadline && !pool_full {
+            while inflight.len() < warmup_concurrency &&
+                sent < warmup_txs &&
+                Instant::now() < warmup_deadline
+            {
+                let idx = sent % senders.len();
+                let signer = senders[idx].clone();
 
-            match tokio::time::timeout(per_rpc_timeout, node.rpc.inject_tx(raw)).await {
-                Ok(Ok(_)) => {
-                    nonces[idx] += 1;
+                let nonce = nonces[idx];
+                nonces[idx] += 1;
+
+                let tx = tx_request(
+                    chain_id,
+                    nonce,
+                    spam_max_fee,
+                    spam_tip,
+                    spam_gas,
+                    spam_data.clone(),
+                );
+                let rpc = rpc.clone();
+                let fut = async move {
+                    let signed = TransactionTestContext::sign_tx(signer, tx).await;
+                    let raw: Bytes = signed.encoded_2718().into();
+                    tokio::time::timeout(
+                        per_rpc_timeout,
+                        rpc.eth_api().send_raw_transaction(raw),
+                    )
+                    .await
+                };
+                inflight.push(fut);
+                sent += 1;
+            }
+
+            match inflight.next().await {
+                Some(Ok(Ok(_))) => {}
+                Some(Ok(Err(err))) => {
+                    let err_msg = err.to_string();
+                    if err_msg.contains("txpool is full") {
+                        pool_full = true;
+                        println!("txpool full");
+                    }
                 }
+                Some(Err(_)) => {
+                    panic!("inject_tx timed out after {:?}", per_rpc_timeout);
+                }
+                None => break,
+            }
+        }
+
+        while let Some(res) = inflight.next().await {
+            match res {
+                Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
-                    if err.to_string().contains("txpool is full") {
+                    let err_msg = err.to_string();
+                    if err_msg.contains("txpool is full") {
+                        println!("txpool full");
                         break;
                     }
                 }
@@ -267,23 +330,62 @@ async fn repro_17064_op_stall_stress() -> eyre::Result<()> {
 
         tokio::time::timeout(per_rpc_timeout, node.rpc.inject_tx(l1_info_tx)).await??;
 
-        // 2) Inject a big batch of low-fee txs.
-        // NOTE: keep this sequential first; you can parallelize later once it compiles & runs.
-        for i in 0..txs_per_block {
-            let idx = i % senders.len();
-            let signer = senders[idx].clone();
+        // 2) Inject a big batch of low-fee txs (parallelized).
+        let mut inflight = FuturesUnordered::new();
+        let mut sent = 0usize;
+        let mut pool_full = false;
 
-            let nonce = nonces[idx];
-            let tx = tx_request(chain_id, nonce, spam_max_fee, spam_tip);
-            let signed = TransactionTestContext::sign_tx(signer, tx).await;
-            let raw: Bytes = signed.encoded_2718().into();
+        while sent < txs_per_block && !pool_full {
+            while inflight.len() < per_block_concurrency && sent < txs_per_block {
+                let idx = ((height as usize).wrapping_mul(txs_per_block) + sent) % senders.len();
+                let signer = senders[idx].clone();
 
-            match tokio::time::timeout(per_rpc_timeout, node.rpc.inject_tx(raw)).await {
-                Ok(Ok(_)) => {
-                    nonces[idx] += 1;
+                let nonce = nonces[idx];
+                nonces[idx] += 1;
+
+                let tx = tx_request(
+                    chain_id,
+                    nonce,
+                    spam_max_fee,
+                    spam_tip,
+                    spam_gas,
+                    spam_data.clone(),
+                );
+                let rpc = rpc.clone();
+                let fut = async move {
+                    let signed = TransactionTestContext::sign_tx(signer, tx).await;
+                    let raw: Bytes = signed.encoded_2718().into();
+                    tokio::time::timeout(
+                        per_rpc_timeout,
+                        rpc.eth_api().send_raw_transaction(raw),
+                    )
+                    .await
+                };
+                inflight.push(fut);
+                sent += 1;
+            }
+
+            match inflight.next().await {
+                Some(Ok(Ok(_))) => {}
+                Some(Ok(Err(err))) => {
+                    let err_msg = err.to_string();
+                    if err_msg.contains("txpool is full") {
+                        pool_full = true;
+                    }
                 }
+                Some(Err(_)) => {
+                    panic!("inject_tx timed out after {:?}", per_rpc_timeout);
+                }
+                None => break,
+            }
+        }
+
+        while let Some(res) = inflight.next().await {
+            match res {
+                Ok(Ok(_)) => {}
                 Ok(Err(err)) => {
-                    if err.to_string().contains("txpool is full") {
+                    let err_msg = err.to_string();
+                    if err_msg.contains("txpool is full") {
                         break;
                     }
                 }

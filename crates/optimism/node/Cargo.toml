@@ -86,7 +86,6 @@ reth-trie-db.workspace = true
 alloy-eips.workspace = true
 alloy-network.workspace = true
 alloy-op-hardforks.workspace = true
-alloy-signer.workspace = true
 futures.workspace = true
 op-alloy-network.workspace = true
 
